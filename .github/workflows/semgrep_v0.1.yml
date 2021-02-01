@@ -1,0 +1,16 @@
+name: sgrep
+
+on: [push]
+
+jobs:
+  sgrep:
+    runs-on: ubuntu-latest
+    name: A job to run sgrep
+    steps:
+      - uses: actions/checkout@v2
+      - name: sgrep action step
+        id: sgrep
+        uses: returntocorp/sgrep-action@master
+        with:
+          config: tests/self_test.yml
+          targets: tests
