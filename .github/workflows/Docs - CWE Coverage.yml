@@ -1,0 +1,275 @@
+name: Docs - CWE Coverage
+'on':
+  workflow_dispatch:
+    inputs:
+      description:
+        description: A description of the purpose of this job. For human consumption.
+        required: false
+      qlSubmoduleShaOverride:
+        description: 'The commit at which to check out the QL submodule, if given.'
+        required: false
+      qlSubmoduleStatusSha:
+        description: >-
+          The SHA (in the QL submodule) to which statuses should be propagated. This input is
+          generally only needed by jobs started by qlucie.
+        required: false
+      qlCheckContextName:
+        description: >-
+          The GitHub status check name to which statuses should be propagated. This input is
+          generally only needed by jobs started by qlucie.
+        required: false
+      callbackSha:
+        description: >-
+          The semmle-code sha to which statuses should be propagated. This input is generally only
+          needed when this workflow has been triggered through the dispatch-on-label job. Required
+          if prNumber is set.
+        required: false
+      prNumber:
+        description: >-
+          The number of the semmle-code pull request to associate this run with. Required if
+          callbackSha is set.
+        required: false
+jobs:
+  check-submodule-and-sha:
+    name: 'Pre-check: Docs - CWE Coverage'
+    runs-on: ubuntu-20.04
+    steps:
+      - name: Dump environment
+        run: env
+      - name: Dump GitHub context
+        env:
+          GITHUB_CONTEXT: '${{ toJson(github) }}'
+        run: echo "$GITHUB_CONTEXT"
+      - name: Validate inputs from label triggers
+        if: >-
+          (github.event.inputs.prNumber && !github.event.inputs.callbackSha) ||
+          (!github.event.inputs.prNumber && github.event.inputs.callbackSha)
+        env:
+          PR_NUMBER: '${{ github.event.inputs.prNumber }}'
+          CALLBACK_SHA: '${{ github.event.inputs.callbackSha }}'
+        run: |2-
+                    # either both $PR_NUMBER and $CALLBACK_SHA or neither
+                    echo "::error::Invalid input parameters 'prNumber' and 'callbackSha' must both be empty or non empty. Got '$PR_NUMBER' and '$CALLBACK_SHA'."
+                    exit 1
+                  
+      - name: Set Green status to pending
+        if: github.event.pull_request
+        env:
+          GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
+          SHA: '${{ github.event.pull_request.head.sha }}'
+        run: |2-
+                    # A new run is starting, ensure this PR cannot be auto-merged.
+                    # Only needed for pull request triggers, not label triggers
+                    # since label triggers will have set status to pending in the
+                    # dispatcher job.
+                    gh api -X POST "repos/github/semmle-code/statuses/$SHA" \
+                      -f state="pending" \
+                      -f description="This PR is not ready to be merged." \
+                      -f context="Green"
+      - name: Get refs for labelled PR
+        id: checkLabelledPr
+        if: github.event.inputs.callbackSha
+        env:
+          GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
+          PR_NUMBER: '${{ github.event.inputs.prNumber }}'
+          CALLBACK_SHA: '${{ github.event.inputs.callbackSha }}'
+        run: |2-
+                    echo "Get the ref from the pull request by making a call to the gh api."
+                    # Check that the HEAD sha still matches the callback sha
+                    # (ie- no more commits have been pushed to this PR).
+                    # If so, then use the merge commit of this PR.
+                    # Otherwise end this job.
+                    PR_INFO="$(gh api repos/github/semmle-code/pulls/$PR_NUMBER)"
+                    HEAD_SHA="$(echo "$PR_INFO" | jq -r '.head.sha')"
+                    MERGE_SHA="$(echo "$PR_INFO" | jq -r '.merge_commit_sha')"
+                    echo "Found head SHA $HEAD_SHA and merge SHA $MERGE_SHA."
+                    echo "Comparing with callback SHA $CALLBACK_SHA"
+                    if [ $HEAD_SHA == $CALLBACK_SHA ]; then
+                      echo "::set-output name=ref::refs/pull/$PR_NUMBER/merge"
+                    else
+                      echo "::error::Head SHA $HEAD_SHA and callback SHA $CALLBACK_SHA do not match. The PR $PR_NUMBER has changed since triggering this job."
+                      exit 1
+                    fi
+                  
+      - name: No need to check submodule
+        id: submoduleCheck
+        run: |2-
+                      echo "This workflow does not depend on paths in the submodule."
+                      echo "::set-output name=hasChanges::true"
+                    
+      - name: Always run job on workflow_dispatch
+        id: runOnDispatch
+        if: github.event_name == 'workflow_dispatch'
+        run: 'echo "::set-output name=hasChanges::true"'
+    outputs:
+      ref: '${{ steps.checkLabelledPr.outputs.ref || github.ref }}'
+      hasChanges: '${{ steps.submoduleCheck.outputs.hasChanges || steps.runOnDispatch.outputs.hasChanges }}'
+  docs-cwe-coverage:
+    name: Docs - CWE Coverage
+    needs:
+      - check-submodule-and-sha
+    if: needs.check-submodule-and-sha.outputs.hasChanges == 'true'
+    runs-on: ubuntu-20.04
+    steps:
+      - name: Dump environment
+        run: env
+      - name: Dump GitHub context
+        env:
+          GITHUB_CONTEXT: '${{ toJson(github) }}'
+        run: echo "$GITHUB_CONTEXT"
+      - name: Report status to external PR
+        if: >-
+          always() && github.event.inputs.qlSubmoduleStatusSha &&
+          github.event.inputs.qlCheckContextName
+        env:
+          GITHUB_TOKEN: '${{ secrets.CI_TOKEN }}'
+          CALLBACK_SHA: '${{ github.event.inputs.qlSubmoduleStatusSha }}'
+          TARGET_URL: 'https://github.com/github/semmle-code/actions/runs/${{ github.run_id }}'
+          STATE: pending
+          JOB_NAME: '${{ github.workflow }}'
+        shell: bash
+        run: |2-
+                set -exu
+                gh api -X POST \
+                repos/github/codeql/statuses/$CALLBACK_SHA \
+                  -F context="${{ github.event.inputs.qlCheckContextName }}" \
+                  -F description="Internal CI run started by Qlucie" \
+                  -F state="$STATE" \
+                  -F target_url="$TARGET_URL"
+              
+      - name: Report status to upstream PR
+        if: always() && github.event.inputs.callbackSha
+        env:
+          GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
+          CALLBACK_SHA: '${{ github.event.inputs.callbackSha }}'
+          TARGET_URL: 'https://github.com/github/semmle-code/actions/runs/${{ github.run_id }}'
+          STATE: pending
+          JOB_NAME: '${{ github.workflow }}'
+        shell: bash
+        run: |2-
+                set -exu
+                gh api -X POST \
+                repos/github/semmle-code/statuses/$CALLBACK_SHA \
+                  -F context="$JOB_NAME" \
+                  -F description="Manual run" \
+                  -F state="$STATE" \
+                  -F target_url="$TARGET_URL"
+              
+      - name: Create problem matchers for checkout errors
+        shell: bash
+        run: >-
+          mkdir -p problem-matchers
+          cat > "problem-matchers/checkout-submodule.json" <<EOF
+          {"problemMatcher":[{"owner":"checkout-submodule","pattern":[{"regexp":"\\\\s*(Fetched in
+          submodule path\\\\s*'(.+)', but it did not contain [a-f0-9]+.\\\\s*Direct fetching of that
+          commit failed.)\\\\s*","message":1,"file":2}]}]}
+          EOF
+          echo "Creating problem matcher named checkout-submodule"
+          cat "problem-matchers/checkout-submodule.json"
+          echo "::add-matcher::problem-matchers/checkout-submodule.json"
+      - name: Checkout with Submodules
+        uses: actions/checkout@v2
+        with:
+          ref: '${{ needs.check-submodule-and-sha.outputs.ref }}'
+          token: '${{ secrets.CI_TOKEN }}'
+          submodules: recursive
+          fetch-depth: 2
+          lfs: true
+      - name: Override submodule checkout
+        shell: bash
+        if: github.event.inputs.qlSubmoduleShaOverride
+        env:
+          SHA_OVERRIDE: '${{ github.event.inputs.qlSubmoduleShaOverride }}'
+        run: |-
+          cd ql
+          git fetch --depth=1 origin "$SHA_OVERRIDE"
+          git checkout FETCH_HEAD
+      - name: Prepare
+        uses: ./.github/actions/prepare-linux
+      - name: Remove problem matchers for checkout errors
+        shell: bash
+        run: |-
+          echo "Removing problem matcher named checkout-submodule"
+          echo "::remove-matcher owner=checkout-submodule::"
+      - name: Enable problem matchers in repository
+        shell: bash
+        run: 'find .github/problem-matchers -name \*.json -exec echo "::add-matcher::{}" \;'
+      - name: Run
+        run: |
+          ./build target/general/cwe-coverage/output/cwe-coverage.md
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v2
+        with:
+          name: cwe-coverage
+          path: target/general/cwe-coverage/output/cwe-coverage.md
+      - name: Report status to external PR
+        if: >-
+          always() && github.event.inputs.qlSubmoduleStatusSha &&
+          github.event.inputs.qlCheckContextName
+        env:
+          GITHUB_TOKEN: '${{ secrets.CI_TOKEN }}'
+          CALLBACK_SHA: '${{ github.event.inputs.qlSubmoduleStatusSha }}'
+          TARGET_URL: 'https://github.com/github/semmle-code/actions/runs/${{ github.run_id }}'
+          STATE: '${{ job.status }}'
+          JOB_NAME: '${{ github.workflow }}'
+        shell: bash
+        run: |2-
+                set -exu
+                case "$STATE" in
+                  error)
+                    ;;
+                  failure)
+                    ;;
+                  pending)
+                    ;;
+                  success)
+                    ;;
+                  cancelled)
+                    STATE=failure
+                    ;;
+                  *)
+                    echo "Unexpected state: $STATE"
+                    STATE=error
+                    ;;
+                esac
+                gh api -X POST \
+                repos/github/codeql/statuses/$CALLBACK_SHA \
+                  -F context="${{ github.event.inputs.qlCheckContextName }}" \
+                  -F description="Internal CI run started by Qlucie" \
+                  -F state="$STATE" \
+                  -F target_url="$TARGET_URL"
+              
+      - name: Report status to upstream PR
+        if: always() && github.event.inputs.callbackSha
+        env:
+          GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
+          CALLBACK_SHA: '${{ github.event.inputs.callbackSha }}'
+          TARGET_URL: 'https://github.com/github/semmle-code/actions/runs/${{ github.run_id }}'
+          STATE: '${{ job.status }}'
+          JOB_NAME: '${{ github.workflow }}'
+        shell: bash
+        run: |2-
+                set -exu
+                case "$STATE" in
+                  error)
+                    ;;
+                  failure)
+                    ;;
+                  pending)
+                    ;;
+                  success)
+                    ;;
+                  cancelled)
+                    STATE=failure
+                    ;;
+                  *)
+                    echo "Unexpected state: $STATE"
+                    STATE=error
+                    ;;
+                esac
+                gh api -X POST \
+                repos/github/semmle-code/statuses/$CALLBACK_SHA \
+                  -F context="$JOB_NAME" \
+                  -F description="Manual run" \
+                  -F state="$STATE" \
+                  -F target_url="$TARGET_URL"
